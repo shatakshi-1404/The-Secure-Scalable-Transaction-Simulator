@@ -1,0 +1,323 @@
+
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <chrono>
+#include <random>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <memory>
+#include <unordered_map>
+
+// Transaction status enumeration
+enum class TransactionStatus {
+    PENDING,
+    APPROVED,
+    DECLINED
+};
+
+// Transaction class
+class Transaction {
+private:
+    static std::atomic<long> next_id;
+    long transaction_id;
+    long account_id;
+    double amount;
+    std::chrono::system_clock::time_point timestamp;
+    TransactionStatus status;
+
+public:
+    Transaction(long acc_id, double amt) 
+        : transaction_id(next_id++), account_id(acc_id), amount(amt), 
+          timestamp(std::chrono::system_clock::now()), status(TransactionStatus::PENDING) {}
+
+    long get_id() const { return transaction_id; }
+    long get_account_id() const { return account_id; }
+    double get_amount() const { return amount; }
+    auto get_timestamp() const { return timestamp; }
+    TransactionStatus get_status() const { return status; }
+    void set_status(TransactionStatus s) { status = s; }
+
+    std::string to_string() const {
+        std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
+        std::stringstream ss;
+        ss << "Transaction ID: " << transaction_id 
+           << " | Account: " << account_id 
+           << " | Amount: $" << std::fixed << std::setprecision(2) << amount
+           << " | Status: " << (status == TransactionStatus::APPROVED ? "APPROVED" : 
+                               (status == TransactionStatus::DECLINED ? "DECLINED" : "PENDING"))
+           << " | Time: " << std::ctime(&time);
+        return ss.str();
+    }
+};
+
+std::atomic<long> Transaction::next_id{1};
+
+// Account class
+class Account {
+private:
+    long account_id;
+    double balance;
+    mutable std::mutex balance_mutex;
+    std::vector<long> recent_transactions; // Track recent transactions for fraud detection
+
+public:
+    Account(long id, double initial_balance) : account_id(id), balance(initial_balance) {}
+
+    long get_id() const { return account_id; }
+    
+    double get_balance() const {
+        std::lock_guard<std::mutex> lock(balance_mutex);
+        return balance;
+    }
+
+    bool process_transaction(std::shared_ptr<Transaction> transaction) {
+        std::lock_guard<std::mutex> lock(balance_mutex);
+        
+        // Basic fraud detection: Check if transaction amount exceeds balance
+        if (transaction->get_amount() > balance) {
+            transaction->set_status(TransactionStatus::DECLINED);
+            return false;
+        }
+        
+        // Update balance and approve transaction
+        balance -= transaction->get_amount();
+        transaction->set_status(TransactionStatus::APPROVED);
+        
+        // Record recent transaction for fraud detection
+        record_transaction(transaction->get_id());
+        
+        return true;
+    }
+
+private:
+    void record_transaction(long transaction_id) {
+        // Keep only the last 10 transactions for simplicity
+        if (recent_transactions.size() >= 10) {
+            recent_transactions.erase(recent_transactions.begin());
+        }
+        recent_transactions.push_back(transaction_id);
+    }
+};
+
+// Thread-safe logger class
+class AuditLogger {
+private:
+    std::ofstream log_file;
+    std::mutex log_mutex;
+
+public:
+    AuditLogger(const std::string& filename) {
+        log_file.open(filename, std::ios::out | std::ios::app);
+        if (!log_file.is_open()) {
+            throw std::runtime_error("Failed to open log file");
+        }
+        
+        // Write header
+        log_file << "=== Transaction Audit Log ===\n";
+        log_file << "Started at: " << get_current_time() << "\n\n";
+    }
+
+    ~AuditLogger() {
+        if (log_file.is_open()) {
+            log_file << "\nLog ended at: " << get_current_time() << std::endl;
+            log_file.close();
+        }
+    }
+
+    void log_transaction(const std::shared_ptr<Transaction>& transaction) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        log_file << transaction->to_string() << std::endl;
+    }
+
+    void log_message(const std::string& message) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        log_file << "[" << get_current_time() << "] " << message << std::endl;
+    }
+
+private:
+    std::string get_current_time() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t time = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::ctime(&time);
+        return ss.str();
+    }
+};
+
+// Transaction processor class
+class TransactionProcessor {
+private:
+    std::queue<std::shared_ptr<Transaction>> transaction_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::vector<std::thread> worker_threads;
+    std::atomic<bool> stop_flag{false};
+    std::shared_ptr<AuditLogger> logger;
+    std::unordered_map<long, std::shared_ptr<Account>> accounts;
+    
+    // Performance metrics
+    std::atomic<long> total_processed{0};
+    std::atomic<long> total_approved{0};
+    std::atomic<long> total_declined{0};
+
+public:
+    TransactionProcessor(int num_threads, std::shared_ptr<AuditLogger> audit_logger) 
+        : logger(audit_logger) {
+        
+        // Initialize some sample accounts
+        initialize_accounts();
+        
+        // Create worker threads
+        for (int i = 0; i < num_threads; ++i) {
+            worker_threads.emplace_back(&TransactionProcessor::process_transactions, this);
+        }
+        
+        logger->log_message("Transaction processor started with " + 
+                           std::to_string(num_threads) + " threads");
+    }
+
+    ~TransactionProcessor() {
+        stop_flag = true;
+        queue_cv.notify_all();
+        
+        for (auto& thread : worker_threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        
+        logger->log_message("Transaction processor stopped");
+        logger->log_message("Performance metrics: " + get_metrics());
+    }
+
+    void add_transaction(std::shared_ptr<Transaction> transaction) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            transaction_queue.push(transaction);
+        }
+        queue_cv.notify_one();
+    }
+
+    std::string get_metrics() const {
+        std::stringstream ss;
+        ss << "Processed: " << total_processed 
+           << " | Approved: " << total_approved 
+           << " | Declined: " << total_declined
+           << " | Approval Rate: " 
+           << (total_processed > 0 ? static_cast<double>(total_approved) / total_processed * 100 : 0)
+           << "%";
+        return ss.str();
+    }
+
+private:
+    void initialize_accounts() {
+        // Create some sample accounts with initial balances
+        for (long i = 1; i <= 10; ++i) {
+            accounts[i] = std::make_shared<Account>(i, 1000.0 * i); // Account i has $1000*i balance
+        }
+    }
+
+    void process_transactions() {
+        while (!stop_flag) {
+            std::shared_ptr<Transaction> transaction;
+            
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_cv.wait(lock, [this]() { 
+                    return !transaction_queue.empty() || stop_flag; 
+                });
+                
+                if (stop_flag && transaction_queue.empty()) {
+                    return;
+                }
+                
+                transaction = transaction_queue.front();
+                transaction_queue.pop();
+            }
+            
+            // Process the transaction
+            process_single_transaction(transaction);
+        }
+    }
+
+    void process_single_transaction(std::shared_ptr<Transaction> transaction) {
+        long account_id = transaction->get_account_id();
+        
+        if (accounts.find(account_id) == accounts.end()) {
+            transaction->set_status(TransactionStatus::DECLINED);
+            logger->log_message("Account " + std::to_string(account_id) + " not found");
+        } else {
+            auto& account = accounts[account_id];
+            bool approved = account->process_transaction(transaction);
+            
+            // Update metrics
+            total_processed++;
+            if (approved) {
+                total_approved++;
+            } else {
+                total_declined++;
+            }
+        }
+        
+        // Log the transaction
+        logger->log_transaction(transaction);
+    }
+};
+
+// Function to generate random transactions
+void generate_transactions(TransactionProcessor& processor, int count) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> account_dist(1, 10); // Accounts 1-10
+    std::uniform_real_distribution<> amount_dist(10.0, 500.0); // Amounts $10-$500
+    
+    for (int i = 0; i < count; ++i) {
+        long account_id = account_dist(gen);
+        double amount = amount_dist(gen);
+        
+        auto transaction = std::make_shared<Transaction>(account_id, amount);
+        processor.add_transaction(transaction);
+        
+        // Sleep for a random short time to simulate real-world transaction timing
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 + gen() % 50));
+    }
+}
+
+int main() {
+    std::cout << "=== Visa-like Transaction Processing Simulator ===\n";
+    
+    try {
+        // Create audit logger
+        auto logger = std::make_shared<AuditLogger>("transaction_audit.log");
+        
+        // Create transaction processor with 4 worker threads
+        TransactionProcessor processor(4, logger);
+        
+        // Generate some transactions in a separate thread
+        std::thread generator([&processor]() {
+            generate_transactions(processor, 100); // Generate 100 transactions
+        });
+        
+        // Wait for transaction generation to complete
+        generator.join();
+        
+        // Give some time for processing to complete
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        // Print final metrics
+        std::cout << "Simulation completed. " << processor.get_metrics() << std::endl;
+        std::cout << "Details logged to transaction_audit.log" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
