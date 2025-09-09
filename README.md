@@ -2,15 +2,12 @@
 Project Idea 1: The Secure & Scalable Transaction Simulator
 This project directly mirrors the core of Visa's business: processing financial transactions securely and reliably.
 
-Why it gets selected:
-
 Core Tech Alignment: Hits the #1 requirement: C++ and Object-Oriented Design.
 
 Domain Relevance: Demonstrates understanding of transaction processing, concurrency, and data integrity—all critical for VisaNet.
 
 Sophistication Signal: Working with multi-threading and network sockets shows you can handle complex, performance-critical systems.
 
-How to Build It:
 
 Core Components (OOD):
 
